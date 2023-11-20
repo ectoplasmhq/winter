@@ -1,0 +1,352 @@
+use actix_multipart::Multipart;
+use actix_web::{web, HttpRequest, HttpResponse};
+use content_inspector::inspect;
+use ffprobe::ffprobe;
+use futures::{StreamExt, TryStreamExt};
+use image::io::Reader as ImageReader;
+use imagesize;
+use nanoid::nanoid;
+use serde_json::json;
+use std::{
+    convert::TryInto,
+    io::{Cursor, Read, Write},
+    process::Command,
+};
+use tempfile::NamedTempFile;
+
+use crate::{
+    config::{get_tag, Config, ContentType},
+    db::*,
+    utils::{
+        result::Error,
+        variables::{
+            self, get_s3_bucket, CLAMD_HOST, LOCAL_STORAGE_PATH, USE_CLAMD,
+        },
+    },
+};
+
+pub fn determine_video_size(
+    path: &std::path::Path,
+) -> Result<(isize, isize), Error> {
+    let data = ffprobe(path).map_err(|_| Error::ProbeError)?;
+
+    // Take the first valid stream
+    for stream in data.streams {
+        if let (Some(h), Some(w)) = (stream.height, stream.width) {
+            if let (Ok(h), Ok(w)) = (h.try_into(), w.try_into()) {
+                return Ok((w, h));
+            }
+        }
+    }
+
+    Err(Error::ProbeError)
+}
+
+pub async fn post(
+    req: HttpRequest,
+    mut payload: Multipart,
+) -> Result<HttpResponse, Error> {
+    let config = Config::global();
+    let (tag_id, tag) = get_tag(&req)?;
+
+    if let Ok(Some(mut field)) = payload.try_next().await {
+        let content_type = field.content_disposition();
+        let filename = content_type
+            .get_filename()
+            .ok_or(Error::FailedToReceive)?
+            .to_string();
+
+        // Read multipart data into a buffer
+        let mut buf: Vec<u8> = Vec::new();
+        let mut file_size: usize = 0;
+
+        while let Some(chunk) = field.next().await {
+            let data = chunk.map_err(|_| Error::FailedToReceive)?;
+            file_size += data.len();
+
+            if file_size > tag.max_size {
+                return Err(Error::FileTooLarge {
+                    max_size: tag.max_size,
+                });
+            }
+
+            buf.append(&mut data.to_vec());
+        }
+
+        // Find the content type of the data
+        let mut content_type = tree_magic::from_u8(&buf);
+
+        // Intercept known file extensions with certain content types
+        if content_type == "application/zip"
+            && filename.to_lowercase().ends_with(".apk")
+        {
+            content_type =
+                "application/vnd.android.package-archive".to_string();
+        }
+
+        if content_type == "application/x-riff" {
+            if filename.to_lowercase().ends_with(".webp") {
+                content_type = "image/webp".to_string();
+            } else if filename.to_lowercase().ends_with(".wav")
+                || filename.to_lowercase().ends_with(".wave")
+            {
+                content_type = "audio/wav".to_string();
+            }
+        }
+
+        let s = &content_type[..];
+
+        let metadata = match s {
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp" => {
+                if let Ok(imagesize::ImageSize { height, width }) =
+                    imagesize::blob_size(&buf)
+                {
+                    if s == "image/jpeg" || s == "image/png" {
+                        let mut cursor = Cursor::new(buf);
+
+                        // Attempt to extract orientation data
+                        let exif_reader = exif::Reader::new();
+                        let rotation = match exif_reader
+                            .read_from_container(&mut cursor)
+                        {
+                            Ok(exif) => {
+                                match exif.get_field(
+                                    exif::Tag::Orientation,
+                                    exif::In::PRIMARY,
+                                ) {
+                                    Some(orientation) => {
+                                        match orientation.value.get_uint(0) {
+                                            Some(v @ 1..=8) => v,
+                                            _ => 0,
+                                        }
+                                    }
+                                    _ => 0,
+                                }
+                            }
+                            _ => 0,
+                        };
+
+                        cursor.set_position(0);
+
+                        // Re-encode JPEGs to remove EXIF data. Also re-encode
+                        // PNGs to mitigate CVE-2023-21036.
+                        let output_format: image::ImageOutputFormat = if s
+                            == "image/jpeg"
+                        {
+                            image::ImageOutputFormat::Jpeg(config.jpeg_quality)
+                        } else {
+                            image::ImageOutputFormat::Png
+                        };
+
+                        let image = ImageReader::new(cursor)
+                            .with_guessed_format()
+                            .map_err(|_| Error::IOError)?
+                            .decode()
+                            .map_err(|_| Error::IOError);
+
+                        let mut bytes: Vec<u8> = Vec::new();
+                        let mut writer = Cursor::new(&mut bytes);
+
+                        // @see https://jdhao.github.io/2019/07/31/image_rotation_exif_info
+                        match &rotation {
+                            2 => image?.fliph(),
+                            3 => image?.rotate180(),
+                            4 => image?.rotate180().fliph(),
+                            5 => image?.rotate90().fliph(),
+                            6 => image?.rotate90(),
+                            7 => image?.rotate270().fliph(),
+                            8 => image?.rotate270(),
+                            _ => image?,
+                        }
+                        .write_to(&mut writer, output_format)
+                        .map_err(|_| Error::IOError)?;
+
+                        buf = bytes;
+
+                        // Calculate dimensions after rotation
+                        let (height, width) = match &rotation {
+                            2 | 4 | 5 | 7 => (width, height),
+                            _ => (height, width),
+                        };
+
+                        Metadata::Image {
+                            height: height
+                                .try_into()
+                                .map_err(|_| Error::IOError)?,
+                            width: width
+                                .try_into()
+                                .map_err(|_| Error::IOError)?,
+                        }
+                    } else {
+                        // GIFs and WebPs will not be re-encoded
+                        Metadata::Image {
+                            height: height
+                                .try_into()
+                                .map_err(|_| Error::IOError)?,
+                            width: width
+                                .try_into()
+                                .map_err(|_| Error::IOError)?,
+                        }
+                    }
+                } else {
+                    Metadata::File
+                }
+            }
+            "video/mp4" | "video/webm" | "video/quicktime" => {
+                let ext = match s {
+                    "video/mp4" => "mp4",
+                    "video/webm" => "webm",
+                    "video/quicktime" => "mov",
+                    _ => unreachable!(),
+                };
+
+                let mut tmp =
+                    NamedTempFile::new().map_err(|_| Error::IOError)?;
+
+                tmp.write_all(&buf).map_err(|_| Error::IOError)?;
+
+                if let Ok(Ok(((width, height), tmp))) = web::block(move || {
+                    determine_video_size(tmp.path()).map(|t| (t, tmp))
+                })
+                .await
+                {
+                    buf = vec![];
+
+                    let out_tmp =
+                        NamedTempFile::new().map_err(|_| Error::IOError)?;
+                    let out_tmp = web::block(move || {
+                        Command::new("ffmpeg")
+                            .args(&[
+                                "-y",
+                                "-i",
+                                tmp.path().to_str().ok_or(Error::IOError)?,
+                                "-map_metadata",
+                                "-1",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "copy",
+                                "-f",
+                                ext,
+                                out_tmp
+                                    .path()
+                                    .to_str()
+                                    .ok_or(Error::IOError)?,
+                            ])
+                            .output()
+                            .map(|_| out_tmp)
+                            .map_err(|_| Error::IOError)
+                    })
+                    .await
+                    .map_err(|_| Error::BlockingError)?
+                    .map_err(|_| Error::IOError)?;
+
+                    let mut file = web::block(move || {
+                        std::fs::File::open(out_tmp.path())
+                            .map(|f| (f, out_tmp))
+                    })
+                    .await
+                    .map_err(|_| Error::BlockingError)?
+                    .map_err(|_| Error::IOError)?;
+
+                    buf = web::block(move || {
+                        file.0.read_to_end(&mut buf).map(|_| buf)
+                    })
+                    .await
+                    .map_err(|_| Error::BlockingError)?
+                    .map_err(|_| Error::IOError)?;
+
+                    Metadata::Video { height, width }
+                } else {
+                    Metadata::File
+                }
+            }
+            _ => {
+                if inspect(&buf).is_text() {
+                    Metadata::Text
+                } else {
+                    // Scan the file for malware
+                    if *USE_CLAMD {
+                        let scan_response = clamav_client::scan_buffer_tcp(
+                            &buf,
+                            CLAMD_HOST.to_string(),
+                            None,
+                        )
+                        .unwrap();
+
+                        let file_clean =
+                            clamav_client::clean(&scan_response).unwrap();
+
+                        if !file_clean {
+                            return Err(Error::Malware);
+                        }
+                    }
+
+                    Metadata::File
+                }
+            }
+        };
+
+        if let Some(content_type) = &tag.restrict_content_type {
+            if !matches!(
+                (content_type, &metadata),
+                (ContentType::Image, Metadata::Image { .. })
+                    | (ContentType::Video, Metadata::Video { .. })
+                    | (ContentType::Audio, Metadata::Audio)
+            ) {
+                return Err(Error::FileTypeNotAllowed);
+            }
+        }
+
+        let id = if tag.use_ulid {
+            ulid::Ulid::new().to_string()
+        } else {
+            nanoid!(42)
+        };
+
+        let file = crate::db::File {
+            id,
+            content_type,
+            deleted: None,
+            filename,
+            metadata,
+            reported: None,
+            size: buf.len() as isize,
+            tag: tag_id.clone(),
+        };
+
+        get_collection("attachments")
+            .insert_one(&file, None)
+            .await
+            .map_err(|_| Error::DatabaseError)?;
+
+        if *variables::USE_S3 {
+            let bucket = get_s3_bucket(&tag_id)?;
+
+            let (_, code) = bucket
+                .put_object(format!("/{}", file.id), &buf)
+                .await
+                .map_err(|_| Error::S3Error)?;
+
+            if code != 200 {
+                return Err(Error::S3Error);
+            }
+        } else {
+            let path = format!("{}/{}", *LOCAL_STORAGE_PATH, &file.id);
+
+            let mut f = web::block(|| std::fs::File::create(path))
+                .await
+                .map_err(|_| Error::BlockingError)?
+                .map_err(|_| Error::IOError)?;
+
+            web::block(move || f.write_all(&buf))
+                .await
+                .map_err(|_| Error::BlockingError)?
+                .map_err(|_| Error::IOError)?;
+        }
+
+        Ok(HttpResponse::Ok().json(json!({ "id": file.id })))
+    } else {
+        Err(Error::MissingData)
+    }
+}

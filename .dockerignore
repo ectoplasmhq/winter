@@ -1,0 +1,9 @@
+/adata
+/data
+/files
+/target
+/various
+.env
+.mongo
+docker-compose.yml
+tmp

@@ -1,0 +1,31 @@
+name: Rust build and test
+
+on:
+  pull_request:
+    branches: ['develop']
+  push:
+    branches: ['develop']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Rust project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install latest nightly
+        uses: actions-rs/toolchain@v1
+        with:
+          components: clippy, rustfmt
+          override: true
+          toolchain: nightly
+      - name: Run cargo build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+      - name: Run cargo test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test

@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.files.excludeDirs": [
+    "various"
+  ],
+  "rust-analyzer.showUnlinkedFileNotification": false
+}
